@@ -4,27 +4,27 @@
 {
     "distutils": {
         "depends": [
-            "/home/ian/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include/numpy/arrayobject.h",
-            "/home/ian/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include/numpy/ufuncobject.h"
+            "/Users/ikinsella/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include/numpy/arrayobject.h",
+            "/Users/ikinsella/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include/numpy/ufuncobject.h"
         ],
         "extra_compile_args": [
             "-O3",
             "-mkl=sequential",
             "-qopenmp",
-            "-I/home/ian/devel/trefide/src",
-            "-I/home/ian/devel/trefide/src/proxtv",
-            "-I/home/ian/devel/trefide/src/glmgen/include",
+            "-I/Users/ikinsella/devel/trefide/src",
+            "-I/Users/ikinsella/devel/trefide/src/proxtv",
+            "-I/Users/ikinsella/devel/trefide/src/glmgen/include",
             "-D NOMATLAB=1"
         ],
         "extra_link_args": [
             "-mkl=sequential",
             "-qopenmp",
-            "-L/home/ian/devel/trefide/src",
-            "-L/home/ian/devel/trefide/src/proxtv",
-            "-L/home/ian/devel/trefide/src/glmgen/lib"
+            "-L/Users/ikinsella/devel/trefide/src",
+            "-L/Users/ikinsella/devel/trefide/src/proxtv",
+            "-L/Users/ikinsella/devel/trefide/src/glmgen/lib"
         ],
         "include_dirs": [
-            "/home/ian/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include"
+            "/Users/ikinsella/miniconda3/envs/idp3/lib/python3.6/site-packages/numpy/core/include"
         ],
         "language": "c++",
         "libraries": [

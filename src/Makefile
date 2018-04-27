@@ -1,12 +1,12 @@
 CXX = icpc
-CXXFLAGS = -mkl=sequential -qopenmp -O3 -fPIC -I$(shell pwd)/proxtv -D NOMATLAB=1 #-mkl=parallel
-LDFLAGS = -shared
+CXXFLAGS = -mkl=sequential -qopenmp -O3 -fPIC -I$(shell pwd)/proxtv -L$(shell pwd)/proxtv -D NOMATLAB=1 #-mkl=parallel
+LDFLAGS = -dynamiclib
 PROXTV = proxtv
-LIBPROXTV = $(PROXTV)/libproxtv.so
+LIBPROXTV = $(PROXTV)/libproxtv.dylib
 GLMGEN = glmgen
-LIBGLMGEN = $(GLMGEN)/libglmgen.so
-TARGET_LIB = libtrefide.so
-LIBS = -lmkl_intel_lp64 -lmkl_core -lm -lmkl_intel_thread -liomp5
+LIBGLMGEN = $(GLMGEN)/libglmgen.dylib
+TARGET_LIB = libtrefide.dylib
+LIBS = -lmkl_intel_lp64 -lmkl_core -lm -lmkl_intel_thread -liomp5 -lproxtv
 SRCS = utils/welch.cpp proxtf/wpdas.cpp proxtf/line_search.cpp proxtf/utils.cpp proxtf/l1tf/ipm.cpp pmd/pmd.cpp
 OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 
