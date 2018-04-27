@@ -209,6 +209,9 @@ short line_search(const int n,           // data length
     }
     *iters += iter;
 
+    evaluate_search_point(n, y, wi, delta, x, &mse, &err);
+    direction = sign(delta-mse);
+
     /************************** Interpolation Phase **************************/
     
     /* Perform K interpolations before transitioning to fixed step */
