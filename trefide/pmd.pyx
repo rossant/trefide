@@ -9,10 +9,12 @@ import time
 import multiprocessing
 
 import numpy as np
+import scipy.sparse as sparse
 cimport numpy as np
 
 from cython.parallel import parallel, prange
-from libc.stdlib cimport abort, calloc, malloc, free
+from libc.stdlib cimport malloc, free
+from libcpp cimport bool
 from sklearn.utils.extmath import randomized_svd as svd
 from functools import partial
 
@@ -21,6 +23,8 @@ FOV_BWIDTH_WARNING = "Input FOV width must be evenly divisible by block width."
 DSUB_BHEIGHT_WARNING = "Block height must be evenly divisible by spatial downsampling factor."
 DSUB_BWIDTH_WARNING = "Block width must be evenly divisible by spatial downsampling factor."
 TSUB_FRAMES_WARNING = "Num Frames must be evenly divisible by temporal downsampling factor."
+EVEN_BHEIGHT_WARNING = "Block height must be an even integer."
+EVEN_BWIDTH_WARNING = "Block width must be an even integer."
 
 
 # -----------------------------------------------------------------------------#
@@ -64,6 +68,26 @@ cdef extern from "trefide.h":
                    const size_t consec_failures,
                    const size_t max_iters_main,
                    const size_t max_iters_init,
+                   const double tol) nogil
+
+    void batch_pmd(const double* input_mov,
+                   const size_t fov_height,
+                   const size_t fov_width,
+                   const size_t num_frames, 
+                   const size_t num_blocks, 
+                   const size_t* block_dims, 
+                   const size_t* block_indices, 
+                   size_t* block_ranks, 
+                   double** spatial_pointers, 
+                   double** temporal_pointers,
+                   size_t d_sub, 
+                   size_t t_sub, 
+                   const double spatial_thresh, 
+                   const double temporal_thresh,
+                   const size_t max_components, 
+                   const size_t consec_failures, 
+                   const size_t max_iters_main, 
+                   const size_t max_iters_init, 
                    const double tol) nogil
 
     void downsample_3d(const int d1, 
@@ -128,851 +152,449 @@ cpdef size_t decimated_decompose(const int d1,
                    max_iters_main, max_iters_init, tol);
 
 # -----------------------------------------------------------------------------#
-# --------------------------- Multi-Block Wrappers ----------------------------#
+# -------------------------- Multi-Block Wrappers -----------------------------#
 # -----------------------------------------------------------------------------#
 
+# --------------------------- Block Partitioning ------------------------------#
 
-cpdef batch_decompose(const int d1, 
-                      const int d2, 
-                      const int t,
-                      double[:, :, ::1] Y, 
-                      const int bheight,
-                      const int bwidth,
-                      const double spatial_thresh,
-                      const double temporal_thresh,
-                      const size_t max_components,
-                      const size_t consec_failures,
-                      const size_t max_iters_main,
-                      const size_t max_iters_init,
-                      const double tol,
-                      int d_sub = 1,
-                      int t_sub = 1):
-    """ Wrapper for the .cpp parallel_factor_patch which wraps the .cpp function 
-     factor_patch with OpenMP directives to parallelize batch processing."""
 
-    # Assert Evenly Divisible FOV/Block Dimensions
-    assert d1 % bheight == 0 , FOV_BHEIGHT_WARNING
-    assert d2 % bwidth == 0 , FOV_BWIDTH_WARNING
-    assert bheight % d_sub == 0 , DSUB_BHEIGHT_WARNING
-    assert bwidth % d_sub == 0 , DSUB_BWIDTH_WARNING
-    assert t % t_sub == 0 , TSUB_FRAMES_WARNING    
+cdef void fill_partition_metadata(const int d1, 
+                                  const int d2, 
+                                  const int block_height,
+                                  const int block_width,
+                                  const bool overlapping,
+                                  size_t* block_dims,
+                                  size_t* block_indices) nogil:
+    """ Compute block shapes & locs for a (potentially overlapping) tiling """
     
-    # Initialize Counters
-    cdef size_t iu, ku
-    cdef int i, j, k, b, bi, bj
-    cdef int nbi = int(d1/bheight)
-    cdef int nbj = int(d2/bwidth)
-    cdef int num_blocks = nbi * nbj
-    cdef int bheight_ds = bheight / d_sub
-    cdef int bwidth_ds = bwidth / d_sub
-    cdef int t_ds = t / t_sub
-
-    # Compute block-start indices and spatial cutoff
-    indices = np.transpose([np.tile(range(nbi), nbj), np.repeat(range(nbj), nbi)])
-
-    # Preallocate Space For Outputs
-    cdef double[:,::1] U = np.zeros((num_blocks, bheight * bwidth * max_components), dtype=np.float64)
-    cdef double[:,::1] V = np.zeros((num_blocks, t * max_components), dtype=np.float64)
-    cdef size_t[::1] K = np.empty((num_blocks,), dtype=np.uint64)
-
-    # Allocate Input Pointers
-    cdef double** Rp = <double **> malloc(num_blocks * sizeof(double*))
-    cdef double** Rp_ds = <double **> malloc(num_blocks * sizeof(double*))
-    cdef double** Vp = <double **> malloc(num_blocks * sizeof(double*))
-    cdef double** Up = <double **> malloc(num_blocks * sizeof(double*))
-
-    # Release Gil Prior To Referencing Address & Calling Multithreaded Code
-    with nogil:
-
-        # Assign Pre-allocated Output Memory To Pointer Array & Allocate Residual Pointers
-        for b in range(num_blocks):
-            Rp[b] = <double *> malloc(bheight * bwidth * t * sizeof(double))
-            Up[b] = &U[b,0]
-            Vp[b] = &V[b,0] 
-
-        # Copy Contents Of Raw Blocks Into Residual Pointers
-        for bj in range(nbj):
-            for bi in range(nbi):
-                for k in range(t):
-                    for j in range(bwidth):
-                        for i in range(bheight):
-                            Rp[bi + (bj * nbi)][i + (j * bheight) + (k * bheight * bwidth)] =\
-                                    Y[(bi * bheight) + i, (bj * bwidth) + j, k]
+    # Declare local variables
+    cdef size_t i, j, nbi, nbj, block_index
+    
+    # Compute ratios of FOV dims / block dims
+    nbi = d1 / block_height 
+    nbj = d2 / block_width
+    
+    # Fill normal tiling 
+    block_index = 0
+    for j in range(nbj):
         
-        # Decimate Raw Blocks
-        if t_sub > 1 or d_sub > 1: 
-            for b in range(num_blocks):
-                Rp_ds[b] = <double *> malloc((bheight / d_sub) * (bwidth / d_sub) * (t / t_sub) * sizeof(double))
-            for b in prange(num_blocks, schedule='guided'):
-                downsample_3d(bheight, bwidth, d_sub, t, t_sub, Rp[b], Rp_ds[b]) 
+        # Full Blocks
+        for i in range(nbi):
+            block_indices[block_index * 2] = i * block_height
+            block_indices[block_index * 2 + 1] = j * block_width 
+            block_dims[block_index * 2] = block_height
+            block_dims[block_index * 2 + 1] = block_width
+            block_index += 1
+
+    # Non-overlapping portion completed
+    if not overlapping:
+        return
+
+    # Fill horizontally skewed tiling
+    for j in range(nbj + 1):
+
+        # Left col of half-width blocks
+        if j == 0:
+            for i in range(nbi):
+                block_indices[block_index * 2] = i * block_height
+                block_indices[block_index * 2 + 1] = 0 
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width / 2
+                block_index += 1
+        
+        # Middle cols of full-size blocks
+        elif j < nbj:
+            for i in range(nbi):
+                block_indices[block_index * 2] = i * block_height
+                block_indices[block_index * 2 + 1] = j * block_width - block_width / 2
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width
+                block_index += 1
+
+        # Right col of half-width blocks
         else:
-            for b in range(num_blocks):
-                Rp_ds[b] = NULL
+            for i in range(nbi):
+                block_indices[block_index * 2] = i * block_height
+                block_indices[block_index * 2 + 1] = d2 - block_width / 2 
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width / 2
+                block_index += 1
 
-        # Factor Blocks In Parallel
-        batch_pmd(bheight, bwidth, d_sub, t, t_sub, num_blocks, 
-                  Rp, Rp_ds, Up, Vp, &K[0], 
-                  spatial_thresh, temporal_thresh,
-                  max_components, consec_failures, 
-                  max_iters_main, max_iters_init, tol)
-        
-        # Free Allocated Memory
-        for b in range(num_blocks):
-            free(Rp[b])
-        if t_sub > 1 or d_sub > 1: 
-            for b in range(num_blocks):
-                free(Rp_ds[b])
-        free(Rp)
-        free(Rp_ds)
-        free(Up)
-        free(Vp)
+    # Fill vertically skewed tiling
+    for j in range(nbj):
+
+        # Top row of half-height blocks
+        block_indices[block_index * 2] = 0
+        block_indices[block_index * 2 + 1] = j * block_width 
+        block_dims[block_index * 2] = block_height / 2
+        block_dims[block_index * 2 + 1] = block_width
+        block_index += 1
+
+        # Middle rows of full-size blocks
+        for i in range(nbi -1):
+            block_indices[block_index * 2] = block_height / 2 + i * block_height
+            block_indices[block_index * 2 + 1] = j * block_width 
+            block_dims[block_index * 2] = block_height
+            block_dims[block_index * 2 + 1] = block_width
+            block_index += 1
+
+        # Bottom row of half-height blocks
+        block_indices[block_index * 2] = d1 - block_height / 2
+        block_indices[block_index * 2 + 1] = j * block_width 
+        block_dims[block_index * 2] = block_height / 2
+        block_dims[block_index * 2 + 1] = block_width
+        block_index += 1
+
+
+    # Fill diagonally skewed tiling
+    for j in range(nbj + 1):
+
+        # Left col of half-width blocks
+        if j == 0:
             
-    # Format Components & Return To Numpy Array
-    return (np.asarray(U).reshape((num_blocks, bheight, bwidth, max_components), order='F'), 
-            np.asarray(V).reshape((num_blocks, max_components, t), order='C'), 
-            np.asarray(K), indices.astype(np.uint64))
+            # Top left corner
+            block_indices[block_index * 2] = 0
+            block_indices[block_index * 2 + 1] = 0
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width / 2
+            block_index += 1
 
+            # Middle rows of full-height blocks
+            for i in range(nbi - 1):
+                block_indices[block_index * 2] = block_height / 2 + i * block_height
+                block_indices[block_index * 2 + 1] = 0
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width / 2
+                block_index += 1
+            
+            # Bottom left corner
+            block_indices[block_index * 2] = d1 - block_height / 2
+            block_indices[block_index * 2 + 1] = 0
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width / 2
+            block_index += 1
 
-cpdef double[:,:,::1] batch_recompose(double[:, :, :, :] U, 
-                                      double[:,:,::1] V, 
-                                      size_t[::1] K, 
-                                      size_t[:,:] indices):
-    """ Reconstruct A Denoised Movie """
+        # Middle cols of full-width blocks
+        elif j < nbj:
 
-    # Get Block Size Info From Spatial
-    cdef size_t num_blocks = U.shape[0]
-    cdef size_t bheight = U.shape[1]
-    cdef size_t bwidth = U.shape[2]
-    cdef size_t t = V.shape[2]
+            # Top row of half-height blocks
+            block_indices[block_index * 2] = 0
+            block_indices[block_index * 2 + 1] = j * block_width - block_width / 2
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width
+            block_index += 1
 
-    # Get Mvie Size Infro From Indices
-    cdef size_t nbi, nbj
-    nbi = np.max(indices[:,0]) + 1
-    nbj = np.max(indices[:,1]) + 1
-    cdef size_t d1 = nbi * bheight
-    cdef size_t d2 = nbj * bwidth
+            # Middle rows of full-size blocks
+            for i in range(nbi - 1):
+                block_indices[block_index * 2] = block_height / 2 + i * block_height
+                block_indices[block_index * 2 + 1] = j * block_width - block_width / 2
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width
+                block_index += 1
+            
+            # Bottom row of half-height blocks
+            block_indices[block_index * 2] = d1 - block_height / 2
+            block_indices[block_index * 2 + 1] = j * block_width - block_width / 2
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width
+            block_index += 1
 
-    # Allocate Space For reconstructed Movies
-    Yd = np.zeros(d1*d2*t, dtype=np.float64).reshape((d1,d2,t))
-
-    # Loop Over Blocks
-    cdef size_t bdx, idx, jdx, kdx
-    for bdx in range(nbi*nbj):
-        idx = indices[bdx,0] * bheight
-        jdx = indices[bdx,1] * bwidth
-        Yd[idx:idx+bheight, jdx:jdx+bwidth,:] += np.reshape(
-                np.dot(U[bdx,:,:,:K[bdx]],
-                       V[bdx,:K[bdx],:]),
-                (bheight,bwidth,t),
-                order='F')
-    # Rank One updates
-    return np.asarray(Yd)
-
-
-# -----------------------------------------------------------------------------#
-# --------------------------- Overlapping Wrappers ----------------------------#
-# -----------------------------------------------------------------------------#
-
-
-cpdef double[:,:,::1] weighted_recompose(double[:, :, :, :] U, 
-                                         double[:,:,:] V, 
-                                         size_t[:] K, 
-                                         size_t[:,:] indices,
-                                         double[:,:] W):
-    """ Reconstruct A Denoised Movie """
-
-    # Get Block Size Info From Spatial
-    cdef size_t num_blocks = U.shape[0]
-    cdef size_t bheight = U.shape[1]
-    cdef size_t bwidth = U.shape[2]
-    cdef size_t t = V.shape[2]
-
-    # Get Mvie Size Infro From Indices
-    cdef size_t nbi, nbj
-    nbi = len(np.unique(indices[:,0]))
-    idx_offset = np.min(indices[:,0])
-    nbj = len(np.unique(indices[:,1]))
-    jdx_offset = np.min(indices[:,1])
-    cdef size_t d1 = nbi * bheight
-    cdef size_t d2 = nbj * bwidth
-
-    # Allocate Space For reconstructed Movies
-    Yd = np.zeros(d1*d2*t, dtype=np.float64).reshape((d1,d2,t))
-
-    # Loop Over Blocks
-    cdef size_t bdx, idx, jdx, kdx
-    for bdx in range(nbi*nbj):
-        idx = (indices[bdx,0] - idx_offset) * bheight
-        jdx = (indices[bdx,1] - jdx_offset) * bwidth
-        Yd[idx:idx+bheight, jdx:jdx+bwidth,:] += np.reshape(
-                np.dot(U[bdx,:,:,:K[bdx]],
-                       V[bdx,:K[bdx],:]),
-                (bheight,bwidth,t),
-                order='F') * np.asarray(W[:,:,None]) 
-    return np.asarray(Yd)
-
-
-cpdef overlapping_batch_decompose(const int d1, 
-                                  const int d2, 
-                                  const int t,
-                                  double[:, :, ::1] Y, 
-                                  const int bheight,
-                                  const int bwidth,
-                                  const double spatial_thresh,
-                                  const double temporal_thresh,
-                                  const size_t max_components,
-                                  const size_t consec_failures,
-                                  const size_t max_iters_main,
-                                  const size_t max_iters_init,
-                                  const double tol,
-                                  int d_sub=1,
-                                  int t_sub=1):
-    """ 4x batch denoiser """
-
-    # Assert Even Blockdims
-    assert bheight % 2 == 0 , "Block height must be an even integer."
-    assert bwidth % 2 == 0 , "Block width must be an even integer."
-    
-    # Assert Even Blockdims
-    assert d1 % bheight == 0 , "Input FOV height must be an evenly divisible by block height."
-    assert d2 % bwidth == 0 , "Input FOV width must be evenly divisible by block width."
-    
-    # Declare internal vars
-    cdef int i,j
-    cdef int hbheight = bheight/2
-    cdef int hbwidth = bwidth/2
-    cdef int nbrow = d1/bheight
-    cdef int nbcol = d2/bwidth
-
-    # -------------------- Construct Combination Weights ----------------------#
-    
-    # Generate Single Quadrant Weighting matrix
-    cdef double[:,:] ul_weights = np.empty((hbheight, hbwidth), dtype=np.float64)
-    for i in range(hbheight):
-        for j in range(hbwidth):
-            ul_weights[i,j] = min(i, j)
-
-    # Compute Cumulative Overlapped Weights (Normalizing Factor)
-    cdef double[:,:] cum_weights = np.asarray(ul_weights) +\
-            np.fliplr(ul_weights) + np.flipud(ul_weights) +\
-            np.fliplr(np.flipud(ul_weights)) 
-
-    # Normalize By Cumulative Weights
-    for i in range(hbheight):
-        for j in range(hbwidth):
-            ul_weights[i,j] = ul_weights[i,j] / cum_weights[i,j]
-
-
-    # Construct Full Weighting Matrix From Normalize Quadrant
-    cdef double[:,:] W = np.hstack([np.vstack([ul_weights, 
-                                               np.flipud(ul_weights)]),
-                                    np.vstack([np.fliplr(ul_weights), 
-                                               np.fliplr(np.flipud(ul_weights))])]) 
-
-    # Initialize Outputs
-    cdef dict U = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict V = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict K = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict I = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    
-    # ---------------- Handle Blocks Overlays One At A Time --------------#
-
-    # ----------- Original Overlay -----------
-    # Only Need To Process Full-Size Blocks
-    U['no_skew']['full'],\
-    V['no_skew']['full'],\
-    K['no_skew']['full'],\
-    I['no_skew']['full'] = batch_decompose(d1, d2, t, Y, bheight, bwidth,
-                                           spatial_thresh,temporal_thresh,
-                                           max_components, consec_failures, 
-                                           max_iters_main, max_iters_init, 
-                                           tol, d_sub=d_sub, t_sub=t_sub)
- 
-    # ---------- Vertical Skew -----------
-    # Full Blocks
-    U['vert_skew']['full'],\
-    V['vert_skew']['full'],\
-    K['vert_skew']['full'],\
-    I['vert_skew']['full'] = batch_decompose(d1 - bheight, d2, t, 
-                                             Y[hbheight:d1-hbheight,:,:], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures,
-                                             max_iters_main, max_iters_init,
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-
-    # wide half blocks
-    U['vert_skew']['half'],\
-    V['vert_skew']['half'],\
-    K['vert_skew']['half'],\
-    I['vert_skew']['half'] = batch_decompose(bheight, d2, t, 
-                                             np.vstack([Y[:hbheight,:,:], 
-                                                        Y[d1-hbheight:,:,:]]),
-                                             hbheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures, 
-                                             max_iters_main, max_iters_init,
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-    
-    # --------------Horizontal Skew---------- 
-    # Full Blocks
-    U['horz_skew']['full'],\
-    V['horz_skew']['full'],\
-    K['horz_skew']['full'],\
-    I['horz_skew']['full'] = batch_decompose(d1, d2 - bwidth, t, 
-                                             Y[:, hbwidth:d2-hbwidth,:], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures, 
-                                             max_iters_main, max_iters_init,
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-
-    # tall half blocks
-    U['horz_skew']['half'],\
-    V['horz_skew']['half'],\
-    K['horz_skew']['half'],\
-    I['horz_skew']['half'] = batch_decompose(d1, bwidth, t, 
-                                             np.hstack([Y[:,:hbwidth,:],
-                                                        Y[:,d2-hbwidth:,:]]),
-                                             bheight, hbwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures, 
-                                             max_iters_main, max_iters_init, 
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-
-    # -------------Diagonal Skew---------- 
-    # Full Blocks
-    U['diag_skew']['full'],\
-    V['diag_skew']['full'],\
-    K['diag_skew']['full'],\
-    I['diag_skew']['full'] = batch_decompose(d1 - bheight, d2 - bwidth, t, 
-                                             Y[hbheight:d1-hbheight,
-                                               hbwidth:d2-hbwidth, :], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures, 
-                                             max_iters_main, max_iters_init, 
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-
-    # tall half blocks
-    U['diag_skew']['thalf'],\
-    V['diag_skew']['thalf'],\
-    K['diag_skew']['thalf'],\
-    I['diag_skew']['thalf'] = batch_decompose(d1 - bheight, bwidth, t, 
-                                             np.hstack([Y[hbheight:d1-hbheight,
-                                                          :hbwidth, :],
-                                                        Y[hbheight:d1-hbheight,
-                                                          d2-hbwidth:, :]]),
-                                             bheight, hbwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures, 
-                                             max_iters_main, max_iters_init, 
-                                             tol, d_sub=d_sub, t_sub=t_sub)
-
-    # wide half blocks
-    U['diag_skew']['whalf'],\
-    V['diag_skew']['whalf'],\
-    K['diag_skew']['whalf'],\
-    I['diag_skew']['whalf'] = batch_decompose(bheight, d2 - bwidth, t, 
-                                             np.vstack([Y[:hbheight, 
-                                                          hbwidth:d2-hbwidth,
-                                                          :], 
-                                                        Y[d1-hbheight:,
-                                                          hbwidth:d2-hbwidth,
-                                                          :]]),
-                                             hbheight, bwidth,
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures,
-                                             max_iters_main, max_iters_init, 
-                                             tol, d_sub=d_sub, t_sub=t_sub) 
-
-    # Corners
-    U['diag_skew']['quarter'],\
-    V['diag_skew']['quarter'],\
-    K['diag_skew']['quarter'],\
-    I['diag_skew']['quarter'] = batch_decompose(bheight, bwidth, t, 
-                                                np.hstack([
-                                                    np.vstack([Y[:hbheight,
-                                                                 :hbwidth,
-                                                                 :], 
-                                                               Y[d1-hbheight:,
-                                                                 :hbwidth,
-                                                                 :]]),
-                                                    np.vstack([Y[:hbheight,
-                                                                 d2-hbwidth:,
-                                                                 :], 
-                                                               Y[d1-hbheight:,
-                                                                 d2-hbwidth:,
-                                                                 :]])
-                                                               ]),
-                                                hbheight, hbwidth,
-                                                spatial_thresh, temporal_thresh,
-                                                max_components, consec_failures, 
-                                                max_iters_main, max_iters_init, 
-                                                tol, d_sub=d_sub, t_sub=t_sub)
-
-    # Return Weighting Matrix For Reconstruction
-    return U, V, K, I, W
-
-
-
-cpdef overlapping_batch_recompose(const int d1,
-                                  const int d2, 
-                                  const int t,
-                                  const int bheight,
-                                  const int bwidth,
-                                  U, V, K, I, W):
-    """ 4x batch denoiser """
-   
-    # Assert Even Blockdims
-    assert bheight % 2 == 0 , "Block height must be an even integer."
-    assert bwidth % 2 == 0 , "Block width must be an even integer."
-    
-    # Assert Even Blockdims
-    assert d1 % bheight == 0 , "Input FOV height must be an evenly divisible by block height."
-    assert d2 % bwidth == 0 , "Input FOV width must be evenly divisible by block width."
-    
-    # Declare internal vars
-    cdef int i,j
-    cdef int hbheight = bheight/2
-    cdef int hbwidth = bwidth/2
-    cdef int nbrow = d1/bheight
-    cdef int nbcol = d2/bwidth
-
-    # Allocate Space For reconstructed Movies
-    Yd = np.zeros((d1,d2,t), dtype=np.float64)
-
-    # ---------------- Handle Blocks Overlays One At A Time --------------#
-
-    # ----------- Original Overlay --------------
-    # Only Need To Process Full-Size Blocks
-    Yd += weighted_recompose(U['no_skew']['full'],
-                             V['no_skew']['full'], 
-                             K['no_skew']['full'], 
-                             I['no_skew']['full'], 
-                             W)
- 
-    # ---------- Vertical Skew --------------
-    # Full Blocks
-    Yd[hbheight:d1-hbheight,:,:] += weighted_recompose(U['vert_skew']['full'],
-                                                       V['vert_skew']['full'],
-                                                       K['vert_skew']['full'], 
-                                                       I['vert_skew']['full'], 
-                                                       W)
-    # wide half blocks
-    Yd[:hbheight,:,:] += weighted_recompose(U['vert_skew']['half'][::2],
-                                            V['vert_skew']['half'][::2],
-                                            K['vert_skew']['half'][::2],
-                                            I['vert_skew']['half'][::2],
-                                            W[hbheight:, :])
-    Yd[d1-hbheight:,:,:] += weighted_recompose(U['vert_skew']['half'][1::2],
-                                               V['vert_skew']['half'][1::2],
-                                               K['vert_skew']['half'][1::2],
-                                               I['vert_skew']['half'][1::2],
-                                               W[:hbheight, :])
-    
-    # --------------Horizontal Skew--------------
-    # Full Blocks
-    Yd[:, hbwidth:d2-hbwidth,:] += weighted_recompose(U['horz_skew']['full'],
-                                                      V['horz_skew']['full'],
-                                                      K['horz_skew']['full'],
-                                                      I['horz_skew']['full'], 
-                                                      W)
-    # tall half blocks
-    Yd[:,:hbwidth,:] += weighted_recompose(U['horz_skew']['half'][:nbrow],
-                                           V['horz_skew']['half'][:nbrow], 
-                                           K['horz_skew']['half'][:nbrow], 
-                                           I['horz_skew']['half'][:nbrow],  
-                                           W[:, hbwidth:])
-    Yd[:,d2-hbwidth:,:] += weighted_recompose(U['horz_skew']['half'][nbrow:],
-                                              V['horz_skew']['half'][nbrow:],
-                                              K['horz_skew']['half'][nbrow:],
-                                              I['horz_skew']['half'][nbrow:],
-                                              W[:, :hbwidth])
-
-    # -------------Diagonal Skew--------------
-    # Full Blocks
-    Yd[hbheight:d1-hbheight, hbwidth:d2-hbwidth, :] += weighted_recompose(U['diag_skew']['full'],
-                                                                          V['diag_skew']['full'],
-                                                                          K['diag_skew']['full'],
-                                                                          I['diag_skew']['full'],
-                                                                          W)
-    # tall half blocks
-    Yd[hbheight:d1-hbheight,:hbwidth,:] += weighted_recompose(U['diag_skew']['thalf'][:nbrow-1],
-                                                              V['diag_skew']['thalf'][:nbrow-1], 
-                                                              K['diag_skew']['thalf'][:nbrow-1], 
-                                                              I['diag_skew']['thalf'][:nbrow-1],  
-                                                              W[:, hbwidth:])
-    Yd[hbheight:d1-hbheight,d2-hbwidth:,:] += weighted_recompose(U['diag_skew']['thalf'][nbrow-1:], 
-                                                                 V['diag_skew']['thalf'][nbrow-1:], 
-                                                                 K['diag_skew']['thalf'][nbrow-1:], 
-                                                                 I['diag_skew']['thalf'][nbrow-1:], 
-                                                                 W[:, :hbwidth])
-    # wide half blocks
-    Yd[:hbheight,hbwidth:d2-hbwidth,:] += weighted_recompose(U['diag_skew']['whalf'][::2], 
-                                                             V['diag_skew']['whalf'][::2], 
-                                                             K['diag_skew']['whalf'][::2], 
-                                                             I['diag_skew']['whalf'][::2],  
-                                                             W[hbheight:, :])
-    Yd[d1-hbheight:,hbwidth:d2-hbwidth,:] += weighted_recompose(U['diag_skew']['whalf'][1::2], 
-                                                                V['diag_skew']['whalf'][1::2], 
-                                                                K['diag_skew']['whalf'][1::2], 
-                                                                I['diag_skew']['whalf'][1::2], 
-                                                                W[:hbheight, :])
-    # Corners
-    Yd[:hbheight,:hbwidth,:] += weighted_recompose(U['diag_skew']['quarter'][:1],
-                                                   V['diag_skew']['quarter'][:1],
-                                                   K['diag_skew']['quarter'][:1],
-                                                   I['diag_skew']['quarter'][:1],
-                                                   W[hbheight:, hbwidth:])
-    Yd[d1-hbheight:,:hbwidth,:] += weighted_recompose(U['diag_skew']['quarter'][1:2],
-                                                      V['diag_skew']['quarter'][1:2],
-                                                      K['diag_skew']['quarter'][1:2],
-                                                      I['diag_skew']['quarter'][1:2],
-                                                      W[:hbheight, hbwidth:])
-    Yd[:hbheight,d2-hbwidth:,:] += weighted_recompose(U['diag_skew']['quarter'][2:3], 
-                                                      V['diag_skew']['quarter'][2:3], 
-                                                      K['diag_skew']['quarter'][2:3], 
-                                                      I['diag_skew']['quarter'][2:3],  
-                                                      W[hbheight:, :hbwidth])
-    Yd[d1-hbheight:,d2-hbwidth:,:] += weighted_recompose(U['diag_skew']['quarter'][3:], 
-                                                         V['diag_skew']['quarter'][3:], 
-                                                         K['diag_skew']['quarter'][3:], 
-                                                         I['diag_skew']['quarter'][3:],  
-                                                         W[:hbheight:, :hbwidth])
-    return np.asarray(Yd)
-
-
-cpdef tv_norm(image):
-    return np.sum(np.abs(image[:,:-1] - image[:,1:])) + np.sum(np.abs(image[:-1,:] - image[1:,:]))
-
-
-cpdef spatial_test_statistic(component):
-    d1, d2 = component.shape
-    return (tv_norm(component) *d1*d2)/ (np.sum(np.abs(component)) * (d1*(d2-1) + d2 * (d1-1)))
-
-
-cpdef temporal_test_statistic(signal):
-    return np.sum(np.abs(signal[2:] + signal[:-2] - 2*signal[1:-1])) / np.sum(np.abs(signal))
-
-
-cpdef pca_patch(R, bheight=None, bwidth=None, num_frames=None, spatial_thresh=None, temporal_thresh=None, 
-                max_components=50, consec_failures=3, n_iter=7):
-    """ """
-    
-    # Preallocate Space For Outputs
-    U = np.zeros((bheight*bwidth, max_components), dtype=np.float64)
-    V = np.zeros((max_components, num_frames), dtype=np.float64)
-
-    if np.sum(np.abs(R)) <= 0:
-        return U, V, 0
-    # Run SVD on the patch
-    Ub, sb, Vtb = svd(R, n_components=max_components, n_iter=n_iter)
-
-    # Iteratively Test & discard components
-    fails = 0
-    K = 0
-    for k in range(max_components):
-        spatial_stat = spatial_test_statistic(Ub[:,k].reshape((bheight,bwidth), order='F'))
-        temporal_stat = temporal_test_statistic(Vtb[k,:])
-        if (spatial_stat > spatial_thresh or
-            temporal_stat > temporal_thresh):
-            fails += 1
-            if fails >= consec_failures:
-                break
+        # Right col of half-width blocks
         else:
-            U[:,K] = Ub[:,k]
-            V[K,:] = Vtb[k,:] * sb[k]
-            fails = 0
-            K += 1
-    return U, V, K
+            
+            # Top right corner
+            block_indices[block_index * 2] = 0
+            block_indices[block_index * 2 + 1] = d2 - block_width / 2
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width / 2
+            block_index += 1
+
+            # Middle rows of full-height blocks
+            for i in range(nbi - 1):
+                block_indices[block_index * 2] = block_height / 2 + i * block_height
+                block_indices[block_index * 2 + 1] = d2 - block_width / 2
+                block_dims[block_index * 2] = block_height
+                block_dims[block_index * 2 + 1] = block_width / 2
+                block_index += 1
+
+            # Bottom right corner
+            block_indices[block_index * 2] = d1 - block_height / 2
+            block_indices[block_index * 2 + 1] = d2 - block_width / 2
+            block_dims[block_index * 2] = block_height / 2
+            block_dims[block_index * 2 + 1] = block_width / 2
+            block_index += 1
+
+# ------------------------ Compressed Component Formatting ------------------------#
 
 
-cpdef pca_decompose(const int d1,
-                    const int d2,
-                    const int t,
-                    double[:, :, ::1] Y,
-                    const int bheight,
-                    const int bwidth,
-                    const double spatial_thresh,
-                    const double temporal_thresh,
-                    const size_t max_components,
-                    const size_t consec_failures):
-    """ Wrapper for the .cpp parallel_factor_patch which wraps the .cpp function
-     factor_patch with OpenMP directives to parallelize batch processing."""
+cpdef size_t[::1] get_format_metadata(const size_t[::1] block_ranks, 
+                                      const size_t[::1] block_dims,
+                                      const size_t num_frames,
+                                      const size_t num_blocks):
+    """ Compute access indices for spatial components stored in compressed format """
 
-    # Assert Evenly Divisible FOV/Block Dimensions
-    assert d1 % bheight == 0 , FOV_BHEIGHT_WARNING
-    assert d2 % bwidth == 0 , FOV_BWIDTH_WARNING
+    # Allocate Internal Vars
+    cdef size_t bdx, num_elems
 
-    # Initialize Counters
-    cdef size_t iu, ku
-    cdef int i, j, k, b, bi, bj
-    cdef int nbi = int(d1/bheight)
-    cdef int nbj = int(d2/bwidth)
-    cdef int num_blocks = nbi * nbj
+    # Compute starting indices of each block in compressed format
+    cdef size_t[::1] block_access = np.zeros((num_blocks + 1) * 2, dtype=np.uint64)
+    for bdx in range(num_blocks):
 
-    # Compute block-start indices and spatial cutoff
-    indices = np.transpose([np.tile(range(nbi), nbj), np.repeat(range(nbj), nbi)])
+        # Spatial blocks: pixels vary by block
+        num_elems = block_dims[bdx * 2] * block_dims[bdx * 2 + 1] * block_ranks[bdx]
+        block_access[bdx * 2 + 2] = block_access[bdx * 2] + num_elems
 
-    cdef size_t good, fails
-    cdef double spatial_stat
-    cdef double temporal_stat
+        # Temporal block: frames constant across blocks
+        block_access[bdx * 2 + 3] = block_access[bdx * 2 + 1] + num_frames * block_ranks[bdx]
 
-    # Copy Residual For Multiprocessing
-    R = []
-    for bj in range(nbj):
-        for bi in range(nbi):
-            R.append(np.reshape(Y[(bi * bheight):((bi+1) * bheight),
-                                  (bj * bwidth):((bj+1) * bwidth), :],
-                                (bheight*bwidth, t), order='F'))
-
-    # Process In Parallel
-    try:
-        pool = multiprocessing.Pool(multiprocessing.cpu_count())
-        results = pool.map(partial(pca_patch, 
-                                   bheight=bheight, bwidth=bwidth, num_frames=t,
-                                   spatial_thresh=spatial_thresh, 
-                                   temporal_thresh=temporal_thresh,
-                                   max_components=max_components, 
-                                   consec_failures=consec_failures),
-                           R)
-    finally:
-        pool.close()
-        pool.join()
+    # Return array of spatial block starting indices
+    return block_access
 
 
-    # Format Components & Return To Numpy Array
-    U, V, K = zip(*results) 
-    return (np.array(U).reshape((num_blocks, bheight, bwidth, max_components), order='F'),
-            np.array(V), np.array(K).astype(np.uint64), indices.astype(np.uint64))
+cdef double[::1] format_spatial(const size_t[::1] block_ranks,
+                                const size_t[::1] block_dims,
+                                const size_t num_blocks,
+                                const size_t[::1] block_access,
+                                const double[:,:] spatial_components):
+    """ Compactly reformat the spatial components as a single array """
 
+    # Allocate Space For Output Array
+    cdef double[::1] spatial_outputs = np.zeros(block_access[num_blocks * 2], dtype=np.float64)
+
+    # Copy Data For Used Components
+    cdef size_t bdx, num_elems
+    for bdx in range(num_blocks):
+        num_elems = block_dims[bdx * 2] * block_dims[bdx * 2 + 1] * block_ranks[bdx]
+        spatial_outputs[block_access[bdx * 2]:block_access[bdx * 2] + num_elems] = spatial_components[bdx, :num_elems] 
+
+    # Return single array containing all spatial components
+    return spatial_outputs
+
+
+cdef double[::1] format_temporal(const size_t[::1] block_ranks,
+                                 const size_t num_frames,
+                                 const size_t num_blocks,
+                                 const size_t[::1] block_access,
+                                 const double[:,::1] temporal_components):
+    """ Compactly reformat the temporal components as a single array """
+
+    # Allocate Space For Output Array 
+    cdef double[::1] temporal_outputs = np.zeros(block_access[num_blocks * 2 + 1], dtype=np.float64)
+
+    # Copy Data For Used Components
+    cdef size_t bdx, num_elems
+    for bdx in range(num_blocks):
+        num_elems = num_frames * block_ranks[bdx]
+        temporal_outputs[block_access[bdx * 2 + 1]:block_access[bdx * 2 + 1] + num_elems] = temporal_components[bdx, :num_elems] 
+
+    # Return single array containing all temporal components
+    return temporal_outputs
+
+# ------------------------ Full FOV PMD(TF,TV) Wrappers ------------------------#
+
+
+cpdef blockwise_decompose(const double[:, :, ::1] input_mov, 
+                          const size_t fov_height, 
+                          const size_t fov_width, 
+                          const size_t num_frames,
+                          const size_t block_height,
+                          const size_t block_width,
+                          const double spatial_thresh,
+                          const double temporal_thresh,
+                          const size_t max_components,
+                          const size_t consec_failures,
+                          const size_t max_iters_main,
+                          const size_t max_iters_init,
+                          const double tol,
+                          bool overlapping=True,
+                          size_t d_sub=1,
+                          size_t t_sub=1):
+    """ Perform blockwise PMD(TV,TF) decomposition on an input movie Y """
     
-cpdef overlapping_pca_decompose(const int d1, 
-                                  const int d2, 
-                                  const int t,
-                                  double[:, :, ::1] Y, 
-                                  const int bheight,
-                                  const int bwidth,
-                                  const double spatial_thresh,
-                                  const double temporal_thresh,
-                                  const size_t max_components,
-                                  const size_t consec_failures):
-    """ 4x batch denoiser """
+    # Validate Input Parameter Choices
+    assert fov_height % block_height == 0, FOV_BHEIGHT_WARNING
+    assert fov_width % block_width == 0, FOV_BWIDTH_WARNING
+    assert block_height % d_sub == 0, DSUB_BHEIGHT_WARNING
+    assert block_width % d_sub == 0, DSUB_BWIDTH_WARNING
+    assert num_frames % t_sub == 0, TSUB_FRAMES_WARNING    
+    if overlapping:
+        assert block_height % 2 == 0, EVEN_BHEIGHT_WARNING
+        assert block_width % 2 == 0, EVEN_BWIDTH_WARNING
+     
+    # Determine number of blocks in (potentially overlapping) partition
+    cdef size_t num_block_rows = fov_height / block_height
+    cdef size_t num_block_cols = fov_width / block_width
+    cdef size_t num_blocks
+    if overlapping:
+        num_blocks = (2 * num_block_rows + 1) * (2 * num_block_cols + 1)
+    else:
+        num_blocks = num_block_rows * num_block_cols
 
-    # Assert Even Blockdims
-    assert bheight % 2 == 0 , "Block height must be an even integer."
-    assert bwidth % 2 == 0 , "Block width must be an even integer."
+    # Prepare block partition metadata
+    cdef size_t[::1] block_dims = np.zeros((num_blocks * 2), dtype=np.uint64)
+    cdef size_t[::1] block_indices = np.zeros((num_blocks * 2), dtype=np.uint64) 
+    cdef size_t[::1] block_ranks = np.zeros((num_blocks,), dtype=np.uint64)
+    fill_partition_metadata(fov_height, fov_width, block_height, block_width,
+                            overlapping, &block_dims[0], &block_indices[0])
     
-    # Assert Even Blockdims
-    assert d1 % bheight == 0 , "Input FOV height must be an evenly divisible by block height."
-    assert d2 % bwidth == 0 , "Input FOV width must be evenly divisible by block width."
+    # Allocate space for spatial components 
+    cdef double[:,::1] spatial_components = np.zeros(
+            (num_blocks, block_height * block_width * max_components), 
+            dtype=np.float64
+        )
+    cdef double** spatial_pointers = <double **> malloc(num_blocks  * sizeof(double*))
     
-    # Declare internal vars
-    cdef int i,j
-    cdef int hbheight = bheight/2
-    cdef int hbwidth = bwidth/2
-    cdef int nbrow = d1/bheight
-    cdef int nbcol = d2/bwidth
-
-    # -------------------- Construct Combination Weights ----------------------#
+    # Allocate space for temporal components
+    cdef double[:,::1] temporal_components = np.zeros(
+            (num_blocks, num_frames * max_components),
+            dtype=np.float64
+        )
+    cdef double** temporal_pointers = <double **> malloc(num_blocks * sizeof(double*))
     
-    # Generate Single Quadrant Weighting matrix
-    cdef double[:,:] ul_weights = np.empty((hbheight, hbwidth), dtype=np.float64)
-    for i in range(hbheight):
-        for j in range(hbwidth):
-            ul_weights[i,j] = min(i, j)
-
-    # Compute Cumulative Overlapped Weights (Normalizing Factor)
-    cdef double[:,:] cum_weights = np.asarray(ul_weights) +\
-            np.fliplr(ul_weights) + np.flipud(ul_weights) +\
-            np.fliplr(np.flipud(ul_weights)) 
-
-    # Normalize By Cumulative Weights
-    for i in range(hbheight):
-        for j in range(hbwidth):
-            ul_weights[i,j] = ul_weights[i,j] / cum_weights[i,j]
-
-
-    # Construct Full Weighting Matrix From Normalize Quadrant
-    cdef double[:,:] W = np.hstack([np.vstack([ul_weights, 
-                                               np.flipud(ul_weights)]),
-                                    np.vstack([np.fliplr(ul_weights), 
-                                               np.fliplr(np.flipud(ul_weights))])]) 
-
-    # Initialize Outputs
-    cdef dict U = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict V = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict K = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
-    cdef dict I = {'no_skew':{}, 'vert_skew':{}, 'horz_skew':{}, 'diag_skew':{}}
+    # Assign pointers to component ndarrays
+    cdef size_t bdx
+    for bdx in range(num_blocks):
+        spatial_pointers[bdx] = &spatial_components[bdx, 0]
+        temporal_pointers[bdx] = &temporal_components[bdx, 0]
     
-    # ---------------- Handle Blocks Overlays One At A Time --------------#
+    # Factor Blocks In Parallel
+    batch_pmd(&input_mov[0,0,0], fov_height, fov_width, num_frames, num_blocks, 
+              &block_dims[0], &block_indices[0], &block_ranks[0], 
+              spatial_pointers, temporal_pointers, d_sub, t_sub, 
+              spatial_thresh, temporal_thresh,
+              max_components, consec_failures, 
+              max_iters_main, max_iters_init, tol)
 
-    # ----------- Original Overlay -----------
-    # Only Need To Process Full-Size Blocks
-    U['no_skew']['full'],\
-    V['no_skew']['full'],\
-    K['no_skew']['full'],\
-    I['no_skew']['full'] = pca_decompose(d1, d2, t, Y, bheight, bwidth,
-                                           spatial_thresh,temporal_thresh,
-                                           max_components, consec_failures)
- 
-    # ---------- Vertical Skew -----------
-    # Full Blocks
-    U['vert_skew']['full'],\
-    V['vert_skew']['full'],\
-    K['vert_skew']['full'],\
-    I['vert_skew']['full'] = pca_decompose(d1 - bheight, d2, t, 
-                                             Y[hbheight:d1-hbheight,:,:], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
+    # Free Allocated Memory
+    free(spatial_pointers)
+    free(temporal_pointers)
+            
+    # Reformat components to store with (minimum amount of) contiguous memory
+    cdef size_t[::1] block_access = get_format_metadata(block_ranks, block_dims, num_frames, num_blocks)
+    cdef double[::1] spatial_outputs = format_spatial(block_ranks, block_dims, num_blocks, block_access, spatial_components)
+    cdef double[::1] temporal_outputs = format_temporal(block_ranks, num_frames, num_blocks, block_access, temporal_components) 
 
-    # wide half blocks
-    U['vert_skew']['half'],\
-    V['vert_skew']['half'],\
-    K['vert_skew']['half'],\
-    I['vert_skew']['half'] = pca_decompose(bheight, d2, t, 
-                                             np.vstack([Y[:hbheight,:,:], 
-                                                        Y[d1-hbheight:,:,:]]),
-                                             hbheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
+    # Reformat (input & output) metadata into nested dictionary
+    metadata = {'params':{'fov_height': fov_height,
+                          'fov_width': fov_width,
+                          'num_frames': num_frames,
+                          'block_height': block_height,
+                          'block_width': block_width,
+                          'spatial_thresh': spatial_thresh,
+                          'temporal_thresh': temporal_thresh,
+                          'max_components': max_components,
+                          'consec_failures': consec_failures,
+                          'max_iters_main': max_iters_main,
+                          'max_iters_init': max_iters_init,
+                          'tol': tol,
+                          'overlapping': overlapping,
+                          'd_sub': d_sub,
+                          't_sub': t_sub},
+                'format':{'num_blocks': num_blocks,
+                          'total_rank': block_access[num_blocks *2 + 1] / num_frames,
+                          'fov_indices': block_indices,
+                          'format_indices': block_access,
+                          'dims': block_dims,
+                          'ranks': block_ranks}}
+
+    return spatial_outputs, temporal_outputs, metadata
+
+
+# -----------------------------------------------------------------------------#
+# ---------------------- Compression Format Utilities -------------------------#
+# -----------------------------------------------------------------------------#
+
+
+cpdef format_as_matrices(double[::1] spatial_components, 
+                         double[::1] temporal_components, 
+                         dict metadata):
+    """ Reformat the compressed spatial and temporal components into the 
+        structured matrices U, V where U is sparse and V is dense"""
+
+    # Declare Internal Variables
+    cdef size_t bdx, k, j0, j, i0, i, block_height, block_width
+
+    # Unpack Useful Params From Metadata
+    cdef size_t fov_height = metadata['params']['fov_height']
+    cdef size_t fov_width = metadata['params']['fov_width']
+    cdef size_t num_frames = metadata['params']['num_frames']
+    cdef size_t num_blocks = metadata['format']['num_blocks']
+    cdef size_t total_rank = metadata['format']['total_rank']
+    cdef size_t[::1] block_indices = metadata['format']['fov_indices']
+    cdef size_t[::1] block_access = metadata['format']['format_indices']
+    cdef size_t[::1] block_dims = metadata['format']['dims']
+    cdef size_t[::1] block_ranks = metadata['format']['ranks']
     
-    # --------------Horizontal Skew---------- 
-    # Full Blocks
-    U['horz_skew']['full'],\
-    V['horz_skew']['full'],\
-    K['horz_skew']['full'],\
-    I['horz_skew']['full'] = pca_decompose(d1, d2 - bwidth, t, 
-                                             Y[:, hbwidth:d2-hbwidth,:], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
+    # Allocate Space For Sparse Matrix Representation
+    cdef size_t[::1] indices = np.zeros(block_access[num_blocks * 2], dtype=np.uint64)
+    cdef size_t[::1] indptr = np.zeros(total_rank + 1, dtype=np.uint64)
+    cdef size_t rank_ind = 0
+    for bdx in range(num_blocks):
+        block_height = block_dims[bdx * 2]
+        block_width = block_dims[bdx * 2 + 1]
+        i0 = block_indices[bdx * 2]
+        j0 = block_indices[bdx * 2 + 1]
+        for k in range(block_ranks[bdx]):
+            indptr[rank_ind+1] = indptr[rank_ind] + block_height * block_width 
+            rank_ind += 1
+            for j in range(block_width):
+                for i in range(block_height):
+                    indices[block_access[bdx * 2] + (k * block_height * block_width) + (block_height * j) + i] = fov_height * (j0 + j) + i0 + i
 
-    # tall half blocks
-    U['horz_skew']['half'],\
-    V['horz_skew']['half'],\
-    K['horz_skew']['half'],\
-    I['horz_skew']['half'] = pca_decompose(d1, bwidth, t, 
-                                             np.hstack([Y[:,:hbwidth,:],
-                                                        Y[:,d2-hbwidth:,:]]),
-                                             bheight, hbwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
-
-    # -------------Diagonal Skew---------- 
-    # Full Blocks
-    U['diag_skew']['full'],\
-    V['diag_skew']['full'],\
-    K['diag_skew']['full'],\
-    I['diag_skew']['full'] = pca_decompose(d1 - bheight, d2 - bwidth, t, 
-                                             Y[hbheight:d1-hbheight,
-                                               hbwidth:d2-hbwidth, :], 
-                                             bheight, bwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
-
-    # tall half blocks
-    U['diag_skew']['thalf'],\
-    V['diag_skew']['thalf'],\
-    K['diag_skew']['thalf'],\
-    I['diag_skew']['thalf'] = pca_decompose(d1 - bheight, bwidth, t, 
-                                             np.hstack([Y[hbheight:d1-hbheight,
-                                                          :hbwidth, :],
-                                                        Y[hbheight:d1-hbheight,
-                                                          d2-hbwidth:, :]]),
-                                             bheight, hbwidth, 
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures)
-
-    # wide half blocks
-    U['diag_skew']['whalf'],\
-    V['diag_skew']['whalf'],\
-    K['diag_skew']['whalf'],\
-    I['diag_skew']['whalf'] = pca_decompose(bheight, d2 - bwidth, t, 
-                                             np.vstack([Y[:hbheight, 
-                                                          hbwidth:d2-hbwidth,
-                                                          :], 
-                                                        Y[d1-hbheight:,
-                                                          hbwidth:d2-hbwidth,
-                                                          :]]),
-                                             hbheight, bwidth,
-                                             spatial_thresh, temporal_thresh,
-                                             max_components, consec_failures) 
-
-    # Corners
-    U['diag_skew']['quarter'],\
-    V['diag_skew']['quarter'],\
-    K['diag_skew']['quarter'],\
-    I['diag_skew']['quarter'] = pca_decompose(bheight, bwidth, t, 
-                                                np.hstack([
-                                                    np.vstack([Y[:hbheight,
-                                                                 :hbwidth,
-                                                                 :], 
-                                                               Y[d1-hbheight:,
-                                                                 :hbwidth,
-                                                                 :]]),
-                                                    np.vstack([Y[:hbheight,
-                                                                 d2-hbwidth:,
-                                                                 :], 
-                                                               Y[d1-hbheight:,
-                                                                 d2-hbwidth:,
-                                                                 :]])
-                                                               ]),
-                                                hbheight, hbwidth,
-                                                spatial_thresh, temporal_thresh,
-                                                max_components, consec_failures)
-
-    # Return Weighting Matrix For Reconstruction
-    return U, V, K, I, W
-
-
-# Temporary TODO: Optimize, streamline, & add more options (multiple simulations when block size large relative to FOV)
-import matplotlib.pyplot as plt
-
-def determine_thresholds(mov_dims, block_dims, num_components,
-                         max_iters_main, max_iters_init, tol, 
-                         d_sub, t_sub, conf, plot):
+    # Construct Scipy CSC Format Object
+    U = sparse.csc_matrix((np.array(spatial_components), np.array(indices), np.array(indptr)),
+                          shape=(fov_height * fov_width, total_rank)) 
     
-    # Simulate Noise Movie
-    noise_mov = np.ascontiguousarray(np.reshape(np.random.randn(np.prod(mov_dims)), mov_dims))
-    
+    # Construct Numpy Object From (Column Major) Array 
+    V = np.reshape(temporal_components, (total_rank, num_frames))
+
+    # Return structured matrices
+    return U, V
+
+
+
+# -----------------------------------------------------------------------------#
+# ---------------------- Threshold Simulation Wrapper -------------------------#
+# -----------------------------------------------------------------------------#
+
+
+#def determine_thresholds(block_dims, num_blocks, consec_failures,
+#                         max_iters_main, max_iters_init, tol, 
+#                         d_sub, t_sub, conf, plot):
+
+    # Simulate Gaussian Noise
+
+
     # Perform Blockwise PMD Of Noise Matrix In Parallel
-    spatial_components,\
-    temporal_components,\
-    block_ranks,\
-    block_indices = batch_decompose(mov_dims[0], mov_dims[1], mov_dims[2],
-                                    noise_mov, block_dims[0], block_dims[1],
-                                    1e3, 1e3,
-                                    num_components, num_components,
-                                    max_iters_main, max_iters_init, tol,
-                                    d_sub=d_sub, t_sub=t_sub)
-    
+    #spatial_components,\
+    #temporal_components,\
+    #block_ranks,\
+    #block_indices = batch_decompose(mov_dims[0], mov_dims[1], mov_dims[2],
+    #                                noise_mov, block_dims[0], block_dims[1],
+    #                                1e3, 1e3,
+    #                                num_components, num_components,
+    #                                max_iters_main, max_iters_init, tol,
+    #                                d_sub=d_sub, t_sub=t_sub)
+
+    # Factor Blocks In Parallel
+    #batch_pmd(&input_mov[0,0,0], fov_height, fov_width, num_frames, num_blocks, 
+    #          &block_dims[0], &block_indices[0], &block_ranks[0], 
+    #          spatial_pointers, temporal_pointers, d_sub, t_sub, 
+    #          spatial_thresh, temporal_thresh,
+    #          max_components, consec_failures, 
+    #          max_iters_main, max_iters_init, tol)
+
     # Gather Test Statistics
-    spatial_stat = []
-    temporal_stat = []
-    num_blocks = int((mov_dims[0] / block_dims[0]) * (mov_dims[1] / block_dims[1]))
-    for block_idx in range(num_blocks): 
-        for k in range(int(block_ranks[block_idx])):
-            spatial_stat.append(spatial_test_statistic(spatial_components[block_idx,:,:,k]))
-            temporal_stat.append(temporal_test_statistic(temporal_components[block_idx,k,:]))
+    #spatial_stat = []
+    #temporal_stat = []
+    #num_blocks = int((mov_dims[0] / block_dims[0]) * (mov_dims[1] / block_dims[1]))
+    #for bdx in range(num_blocks):
+    #    for k in range(int(block_ranks[block_idx])):
+    #        spatial_stat.append(spatial_test_statistic(spatial_components[block_idx, :, :, k]))
+    #        temporal_stat.append(temporal_test_statistic(temporal_components[block_idx, k, :]))
 
     # Compute Thresholds
-    spatial_thresh =  np.percentile(spatial_stat, conf)
-    temporal_thresh = np.percentile(temporal_stat, conf)
-    
-    if plot:
-        fig, ax = plt.subplots(2,2,figsize=(8,8))
-        ax[0,0].scatter(spatial_stat, temporal_stat, marker='x', c='r', alpha = .2)
-        ax[0,0].axvline(spatial_thresh)
-        ax[0,0].axhline(temporal_thresh)
-        ax[0,1].hist(temporal_stat, bins=20, color='r')
-        ax[0,1].axvline(temporal_thresh)
-        ax[0,1].set_title("Temporal Threshold: {}".format(temporal_thresh))
-        ax[1,0].hist(spatial_stat, bins=20, color='r')
-        ax[1,0].axvline(spatial_thresh)
-        ax[1,0].set_title("Spatial Threshold: {}".format(spatial_thresh))
-        plt.show()
-    
-    return spatial_thresh, temporal_thresh
+    #spatial_thresh =  np.percentile(spatial_stat, conf)
+    #temporal_thresh = np.percentile(temporal_stat, conf)
+
+    #return spatial_thresh, temporal_thresh

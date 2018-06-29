@@ -875,26 +875,55 @@ size_t pmd(const MKL_INT d1,
 }
 
 
+/* Copy patch of shared input movie (row major) into block residual (column major)
+ */
+void copy_block(const double* input_mov,
+                const size_t fov_height,
+                const size_t fov_width,
+                const size_t num_frames,
+                const size_t block_height,
+                const size_t block_width,
+                const size_t i0,
+                const size_t j0,
+                double* residual)
+{   
+    // Declare local variables
+    size_t i, j, k, idx;
+    
+    // Fill block in column major order
+    idx = 0;
+    for (k = 0; k < num_frames; k++){
+        for (j = 0; j < block_width; j++){
+            for (i = 0; i < block_height; i++){
+                residual[idx] = input_mov[(i0 + i) * (fov_width * num_frames) +\
+                                          (j0 + j) * num_frames + k];
+                idx++;
+            }
+        }
+    }
+}
+
 /* Wrap TV/TF Penalized Matrix Decomposition with OMP directives to enable parallel, 
  * block-wiseprocessing of large datasets in shared memory.
  */
-void batch_pmd(const MKL_INT bheight,
-               const MKL_INT bwidth, 
-               MKL_INT d_sub,
-               const MKL_INT t,
-               MKL_INT t_sub,
-               const int b,
-               double** Rp, 
-               double** Rp_ds, 
-               double** Up,
-               double** Vp,
-               size_t* K,
-               const double spatial_thresh,
+void batch_pmd(const double* input_mov,
+               const size_t fov_height,
+               const size_t fov_width,
+               const size_t num_frames, 
+               const size_t num_blocks, 
+               const size_t* block_dims, 
+               const size_t* block_indices, 
+               size_t* block_ranks, 
+               double** spatial_pointers, 
+               double** temporal_pointers,
+               MKL_INT d_sub, 
+               MKL_INT t_sub, 
+               const double spatial_thresh, 
                const double temporal_thresh,
-               const size_t max_components,
-               const size_t consec_failures,
-               const size_t max_iters_main,
-               const size_t max_iters_init,
+               const size_t max_components, 
+               const size_t consec_failures, 
+               const size_t max_iters_main, 
+               const size_t max_iters_init, 
                const double tol)
 {
     // Create FFT Handle So It can Be Shared Aross Threads
@@ -908,17 +937,42 @@ void batch_pmd(const MKL_INT bheight,
         fprintf(stderr, "Error while creating MKL_FFT Handle: %ld\n", status);
 
     // Loop Over All Patches In Parallel
-    int m;
-    #pragma omp parallel for shared(FFT) schedule(guided)
-    for (m = 0; m < b; m++){
-        //Use dummy vars for decomposition  
-        K[m] = pmd(bheight, bwidth, d_sub, t, t_sub,
-                   Rp[m], Rp_ds[m], Up[m], Vp[m], 
-                   spatial_thresh, temporal_thresh,
-                   max_components, consec_failures,
-                   max_iters_main, max_iters_init, tol, &FFT);
-    }
+    size_t bdx;
+ 
+    #pragma omp parallel shared(FFT) 
+    {
+        // Allocate thread-private memory for residuals
+        size_t residual_elems = block_dims[0] * block_dims[1] * num_frames;
+        double* residual = (double*) malloc(residual_elems * sizeof(double));
+        double* residual_ds = (double*) malloc(residual_elems / (d_sub * d_sub * t_sub) * sizeof(double));
 
+        #pragma omp for schedule(guided)
+        for (bdx = 0; bdx < num_blocks; bdx++){
+            
+            // Copy patch of shared input data into private block residual
+            copy_block(input_mov, fov_height, fov_width, num_frames, 
+                       block_dims[bdx * 2], block_dims[bdx * 2 +  1], 
+                       block_indices[bdx * 2], block_indices[bdx * 2 + 1], 
+                       residual);
+
+            // Downsample block residual
+            if (d_sub > 1 || t_sub > 1){
+                downsample_3d(block_dims[bdx * 2], block_dims[bdx * 2 + 1], 
+                              d_sub, num_frames, t_sub, residual, residual_ds);
+            }
+
+            //Use dummy vars for decomposition  
+            block_ranks[bdx] = pmd(block_dims[bdx * 2], block_dims[bdx * 2 + 1], 
+                                   d_sub, num_frames, t_sub, residual, residual_ds, 
+                                   spatial_pointers[bdx], temporal_pointers[bdx], 
+                                   spatial_thresh, temporal_thresh,
+                                   max_components, consec_failures,
+                                   max_iters_main, max_iters_init,  tol, &FFT);
+        }
+        // free thread-private memory
+        free(residual);
+        free(residual_ds);
+    }
     // Free MKL FFT Handle
     status = DftiFreeDescriptor( &FFT ); 
     if (status != 0)
