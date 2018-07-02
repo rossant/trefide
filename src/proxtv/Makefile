@@ -22,16 +22,24 @@ ifeq ($(detected_OS),Linux)
     LDFLAGS = -shared
 endif
 
-# TODO: Set Compiler Specific Environment Variables
+# Project Structure Dependent Variables
 
 # OS Agnostic Environment Variables
-CXX = icpc
-CXXFLAGS = -mkl=sequential -O3 -fPIC -D NOMATLAB=1 #-qopenmp
 TARGET = libproxtv$(EXT)
-LIBS = -lmkl_intel_lp64 -lmkl_core -lm  # -lmkl_intel_thread -liomp5
+LIBS = -lmkl_intel_lp64 -lmkl_core -lm
 SRCS = condat_fast_tv.cpp johnsonRyanTV.cpp TVL1opt_kolmogorov.cpp LPopt.cpp TV2Dopt.cpp TV2DWopt.cpp TVgenopt.cpp TVL1opt.cpp TVL1opt_tautstring.cpp TVL1opt_hybridtautstring.cpp TVL1Wopt.cpp TVL2opt.cpp TVLPopt.cpp TVNDopt.cpp utils.cpp
 OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 
+# Compiler Dependent Environment Variables 
+ifeq ($(CC), gcc)
+    CXX = g++
+    CXXFLAGS = -O3 -fPIC -D NOMATLAB=1
+else
+    CXX = icpc
+    CXXFLAGS = -mkl=sequential -O3 -fPIC -D NOMATLAB=1
+endif
+
+# Recipes
 .PHONY: all
 all: $(TARGET)
 

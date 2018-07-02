@@ -22,15 +22,19 @@ ifeq ($(detected_OS),Linux)
     LDFLAGS = -shared
 endif
 
-# TODO: Set Compiler Specific Environment Variables
-
-CC=icc
-CFLAGS=-O3 -Wall -Wextra -ansi -std=c89 -pedantic
-CFLAGS2=-O3
+# Project Structure Dependent Variables
 OBJ=obj/*.o
 IDIR=../include/
 TARGET=lib/libglmgen${EXT}
 
+# Compiler Dependent Environment Variables 
+ifneq ($(CC), gcc)
+    CC = icc
+endif
+CFLAGS=-O3 -Wall -Wextra -ansi -std=c89 -pedantic
+CFLAGS2=-O3
+
+# Recipes
 all:
 	mkdir -p lib
 	mkdir -p obj

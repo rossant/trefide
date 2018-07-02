@@ -22,20 +22,28 @@ ifeq ($(detected_OS),Linux)
     LDFLAGS = -shared
 endif
 
-# TODO: Set Compiler Specific Environment Variables
-
-# OS Agnostic Environment Variables
-CXX = icpc
-CXXFLAGS = -mkl=sequential -qopenmp -O3 -fPIC -I$(shell pwd)/proxtv/  -L$(shell pwd)/$(PROXTV) -I$(shell pwd)/glmgen/include/ -L$(shell pwd)/$(GLMGEN)/lib -D NOMATLAB=1 #-mkl=parallel
-PROXTV = proxtv
+# Project Structure Dependent Variables
+PROXTV = $(shell pwd)/proxtv
 LIBPROXTV = $(PROXTV)/libproxtv$(EXT)
-GLMGEN = glmgen
+GLMGEN = $(shell pwd)/glmgen
 LIBGLMGEN = $(GLMGEN)/lib/libglmgen$(EXT)
 LIBTREFIDE = libtrefide$(EXT)
 LIBS = -lproxtv -lglmgen -lmkl_intel_lp64 -lmkl_core -lm -lmkl_intel_thread -liomp5
 SRCS = utils/welch.cpp proxtf/wpdas.cpp proxtf/line_search.cpp proxtf/utils.cpp proxtf/l1tf/ipm.cpp proxtf/admm.cpp pmd/pmd.cpp pmd/decimation.cpp
 OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 
+# Compiler Dependent Environment Variables 
+ifeq ($(CC), gcc)
+    CXX = g++
+    CXXFLAGS = -fopenmp -O3 -fPIC -I$(PROXTV) -I$(GLMGEN)/include -L$(PROXTV) -L$(GLMGEN)/lib -D NOMATLAB=1
+
+else
+    CXX = icpc
+    CXXFLAGS = -mkl=sequential -qopenmp -O3 -fPIC -I$(PROXTV) -I$(GLMGEN)/include -L$(PROXTV) -L$(GLMGEN)/lib -D NOMATLAB=1
+
+endif
+
+# Recipes
 .PHONY: all
 all: $(LIBPROXTV) $(LIBGLMGEN) $(LIBTREFIDE)
 
