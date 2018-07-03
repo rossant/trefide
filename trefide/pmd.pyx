@@ -98,6 +98,13 @@ cdef extern from "trefide.h":
                        const double *Y, 
                        double *Y_ds) nogil
 
+    double spatial_test_statistic(const int d1,
+                                  const int d2,
+                                  const double* u_k) nogil
+
+    double temporal_test_statistic(const int t,
+                                   const double* v_k) nogil
+
 # -----------------------------------------------------------------------------#
 # -------------------------- Single-Block Wrapper -----------------------------#
 # -----------------------------------------------------------------------------#
@@ -558,43 +565,107 @@ cpdef format_as_matrices(double[::1] spatial_components,
 # -----------------------------------------------------------------------------#
 
 
-#def determine_thresholds(block_dims, num_blocks, consec_failures,
-#                         max_iters_main, max_iters_init, tol, 
-#                         d_sub, t_sub, conf, plot):
+cdef void evaluate_spatial_statistics(double* spatial_components,
+                                      double* spatial_stats,
+                                      size_t block_height,
+                                      size_t block_width,
+                                      size_t num_components):
+    """ """
+    cdef int k
+    with nogil:
+        for k in prange(<int> num_components, schedule="static"):
+            spatial_stats[k] = spatial_test_statistic(block_height, block_width,
+                                                      &spatial_components[block_height * block_width * k])
+ 
 
-    # Simulate Gaussian Noise
+cdef void evaluate_temporal_statistics(double* temporal_components,
+                                       double* temporal_stats,
+                                       size_t num_frames,
+                                       size_t num_components):
+    """ """
+    cdef int k
+    with nogil:
+        for k in prange(<int> num_components, schedule="static"):
+            temporal_stats[k] = temporal_test_statistic(num_frames, 
+                                                        &temporal_components[num_components * k])
 
 
-    # Perform Blockwise PMD Of Noise Matrix In Parallel
-    #spatial_components,\
-    #temporal_components,\
-    #block_ranks,\
-    #block_indices = batch_decompose(mov_dims[0], mov_dims[1], mov_dims[2],
-    #                                noise_mov, block_dims[0], block_dims[1],
-    #                                1e3, 1e3,
-    #                                num_components, num_components,
-    #                                max_iters_main, max_iters_init, tol,
-    #                                d_sub=d_sub, t_sub=t_sub)
+def simulate_thresholds(size_t block_height, 
+                        size_t block_width, 
+                        size_t num_frames, 
+                        size_t num_blocks, 
+                        size_t max_threads, 
+                        size_t consec_failures, 
+                        size_t max_iters_main, 
+                        size_t max_iters_init, 
+                        double tol, 
+                        size_t d_sub, 
+                        size_t t_sub, 
+                        double conf):
+    """ """
 
-    # Factor Blocks In Parallel
-    #batch_pmd(&input_mov[0,0,0], fov_height, fov_width, num_frames, num_blocks, 
-    #          &block_dims[0], &block_indices[0], &block_ranks[0], 
-    #          spatial_pointers, temporal_pointers, d_sub, t_sub, 
-    #          spatial_thresh, temporal_thresh,
-    #          max_components, consec_failures, 
-    #          max_iters_main, max_iters_init, tol)
+    # Compute Iterations Required To Reduce Memory Used
+    cdef size_t repetitions = num_blocks / max_threads
 
-    # Gather Test Statistics
-    #spatial_stat = []
-    #temporal_stat = []
-    #num_blocks = int((mov_dims[0] / block_dims[0]) * (mov_dims[1] / block_dims[1]))
-    #for bdx in range(num_blocks):
-    #    for k in range(int(block_ranks[block_idx])):
-    #        spatial_stat.append(spatial_test_statistic(spatial_components[block_idx, :, :, k]))
-    #        temporal_stat.append(temporal_test_statistic(temporal_components[block_idx, k, :]))
+    # Allocate Space For Simulated Statistics
+    cdef double[::1] spatial_stats = np.zeros(num_blocks * consec_failures, 
+                                              dtype=np.float64)
+    cdef double[::1] temporal_stats = np.zeros(num_blocks * consec_failures,
+                                               dtype=np.float64)
+
+    # Allocate space for spatial components 
+    cdef double[:,::1] spatial_components = np.zeros(
+            (num_blocks, block_height * block_width * consec_failures), 
+            dtype=np.float64
+        )
+    cdef double** spatial_pointers = <double **> malloc(max_threads * sizeof(double*))
+
+    # Allocate space for temporal components
+    cdef double[:,::1] temporal_components = np.zeros(
+            (num_blocks, num_frames * consec_failures),
+            dtype=np.float64
+        )
+    cdef double** temporal_pointers = <double **> malloc(max_threads * sizeof(double*))
+
+    # Assign pointers to component ndarrays
+
+    # Break into repetitions to avoid memory issues 
+    cdef size_t bdx, rep
+    cdef size_t[::1] block_dims, block_indices, block_ranks
+    cdef double[:,:,::1] noise
+    for rep in range(repetitions):
+
+        # Simulate Noise
+        noise = np.reshape(np.random.randn(block_height * block_width * max_threads * num_frames),
+                           (block_height, block_width * max_threads, num_frames))
+
+        # Allocate Space For Decomposition
+        block_dims = np.zeros((max_threads * 2), dtype=np.uint64)
+        block_indices = np.zeros((max_threads * 2), dtype=np.uint64) 
+        block_ranks = np.zeros((max_threads,), dtype=np.uint64)
+        fill_partition_metadata(block_height, max_threads * block_width, 
+                                block_height, block_width, False,
+                                &block_dims[0], &block_indices[0])
+
+        # Transfer Components Pointers
+        for bdx in range(max_threads):
+            spatial_pointers[bdx] = &spatial_components[rep * max_threads + bdx, 0]
+            temporal_pointers[bdx] = &temporal_components[rep * max_threads + bdx, 0]
+
+        # Factor Blocks In Parallel
+        batch_pmd(&noise[0,0,0], block_height, block_width * max_threads, num_frames,
+                  max_threads, &block_dims[0], &block_indices[0], &block_ranks[0], 
+                  spatial_pointers, temporal_pointers, d_sub, t_sub, 1e3, 1e3, 
+                  consec_failures, consec_failures, max_iters_main, max_iters_init, tol)
+
+    # Translate Components To Statistics
+    evaluate_spatial_statistics(&spatial_components[0,0], &spatial_stats[0],
+                                block_height, block_width, num_blocks * consec_failures)
+    evaluate_temporal_statistics(&temporal_components[0,0], &temporal_stats[0],
+                                 num_frames, num_blocks * consec_failures)
 
     # Compute Thresholds
-    #spatial_thresh =  np.percentile(spatial_stat, conf)
-    #temporal_thresh = np.percentile(temporal_stat, conf)
+    spatial_thresh =  np.percentile(spatial_stats, conf)
+    temporal_thresh = np.percentile(temporal_stats, conf)
 
-    #return spatial_thresh, temporal_thresh
+    return (spatial_thresh, temporal_thresh), spatial_stats, temporal_stats
