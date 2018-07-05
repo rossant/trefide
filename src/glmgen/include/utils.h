@@ -91,12 +91,12 @@ typedef llnode linkedlist;
 
 /* Small utility functions found in utils.c */
 double glmgen_factorial(int n);
-double l1norm(double * x, int n);
+double l1norm(const double * x, int n);
 int is_nan(double x);
 int has_nan(double * x, int n);
 int count_nans(double * x, int n);
 
-cs * scalar_plus_diag(const cs * A, double b, double *D);
+cs * scalar_plus_diag(const cs * A, double b, const double *D);
 void diag_times_sparse(const cs * A, double * w);
 
 double logi_b(double x);

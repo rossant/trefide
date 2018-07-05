@@ -183,7 +183,7 @@ cs * tf_calc_dktil (int n, int k, const double * x)
  * @return void
  * @see tf_dxtil
  */
-void tf_dx(double *x, int n, int k,double *a, double *b)
+void tf_dx(const double *x, int n, int k, double *a, double *b)
 {
   int i;
   int j;
@@ -234,7 +234,7 @@ void tf_dx(double *x, int n, int k,double *a, double *b)
  * @return void
  * @see tf_dx
  */
-void tf_dxtil(double *x, int n, int k,double *a, double *b)
+void tf_dxtil(const double *x, int n, int k,double *a, double *b)
 {
   int i;
 
@@ -259,7 +259,7 @@ void tf_dxtil(double *x, int n, int k,double *a, double *b)
  * @return void
  * @see tf_dtxtil
  */
-void tf_dtx(double *x, int n, int k, double *a, double *b)
+void tf_dtx(const double *x, int n, int k, double *a, double *b)
 {
   int i;
   int j;
@@ -309,7 +309,7 @@ void tf_dtx(double *x, int n, int k, double *a, double *b)
  * @return void
  * @see tf_dtx
  */
-void tf_dtxtil(double *x, int n, int k,double *a, double *b)
+void tf_dtxtil(const double *x, int n, int k,double *a, double *b)
 {
   int i;
 

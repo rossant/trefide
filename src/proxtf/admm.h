@@ -4,9 +4,9 @@
 # include "../glmgen/include/cs.h"
 short cps_tf_admm(const int n,        // data length
                   const int degree,
-                  double* x,          // data locations
-                  double *y,          // data observations
-                  double *w,          // data observation weights
+                  const double* x,          // data locations
+                  const double *y,          // data observations
+                  const double *w,          // data observation weights
                   cs * DktDk,         // Difference Gram
                   const double delta, // MSE constraint (noise var estimate)	
                   double *beta,       // primal variable
@@ -20,9 +20,9 @@ short cps_tf_admm(const int n,        // data length
 
 
 short constrained_tf_admm(const int n,           // data length
-                          double* x,             // data locations
-                          double *y,             // data observations
-                          double *w,             // data observation weights
+                          const double* x,             // data locations
+                          const double *y,             // data observations
+                          const double *w,             // data observation weights
                           const double delta,    // MSE constraint (noise var estimate)	
                           double *beta,          // primal variable
                           double *alpha,
@@ -34,9 +34,9 @@ short constrained_tf_admm(const int n,           // data length
 
 
 short langrangian_tf_admm(const int n,           // data length
-                          double* x,             // data locations
-                          double *y,             // data observations
-                          double *w,             // data observation weights
+                          const double* x,             // data locations
+                          const double *y,             // data observations
+                          const double *w,             // data observation weights
                           double lambda,        // regularization parameter
                           double *beta,          // primal variable
                           double *alpha,

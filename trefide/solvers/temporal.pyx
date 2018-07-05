@@ -81,9 +81,9 @@ cdef extern from "trefide.h":
 			   const int verbose) nogil
     
     short constrained_tf_admm(const int n,           # data length
-                              double* x,             # data locations
-                              double *y,             # data observations
-                              double *w,             # data observation weights
+                              const double* x,             # data locations
+                              const double *y,             # data observations
+                              const double *w,             # data observation weights
                               const double delta,    # MSE constraint (noise var estimate)	
                               double *beta,          # primal variable
                               double *alpha,
@@ -94,9 +94,9 @@ cdef extern from "trefide.h":
                               const int verbose) nogil
 
     short langrangian_tf_admm(const int n,           # data length
-                              double* x,             # data locations
-                              double *y,             # data observations
-                              double *w,             # data observation weights
+                              const double* x,             # data locations
+                              const double *y,             # data observations
+                              const double *w,             # data observation weights
                               double lambda_,        # regularization parameter
                               double *beta,          # primal variable
                               double *alpha,

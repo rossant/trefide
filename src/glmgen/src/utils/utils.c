@@ -62,7 +62,7 @@ int has_nan(double * x, int n) {
   return 0;
 }
 
-double l1norm(double * x, int n) {
+double l1norm(const double * x, int n) {
   int i;
   double s;
   s = 0;
@@ -123,7 +123,7 @@ void diag_times_sparse (const cs * A, double * w)
 
 /* Calculates A*b + D (identity), for a square matrix
    A and scalar b */
-cs * scalar_plus_diag (const cs * A, double b, double *D)
+cs * scalar_plus_diag (const cs * A, double b, const double *D)
 {
   int i;
   int j;

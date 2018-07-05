@@ -372,7 +372,7 @@ void tf_admm ( double * x, double * y, double * w, int n, int k, int family,
  * @return void
  * @see tf_admm
  */
-void tf_admm_gauss (double * x, double * y, double * w, int n, int k,
+void tf_admm_gauss (const double * x, const double * y, const double * w, int n, int k,
     int max_iter, double lam, int * df,
     double * beta, double * alpha, double * u,
     double * obj, int * iter,

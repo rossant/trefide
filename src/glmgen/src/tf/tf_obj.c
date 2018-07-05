@@ -3,7 +3,7 @@
 
 /*   Buffer buf should be big enough to hold D^{x,k+1} beta. */
 
-double tf_obj(double *x, double *y, double *w, int n, int k, double lambda, 
+double tf_obj(const double *x, const double *y, const double *w, int n, int k, double lambda, 
     int family, double *beta, double *buf) {
 
   switch (family)
@@ -21,7 +21,7 @@ double tf_obj(double *x, double *y, double *w, int n, int k, double lambda,
   return 0;
 }
 
-double tf_obj_gauss(double *x, double *y, double *w, int n, int k, double lambda, 
+double tf_obj_gauss(const double *x, const double *y, const double *w, int n, int k, double lambda, 
     double *beta, double *buf) {
 
   int i;
@@ -36,7 +36,7 @@ double tf_obj_gauss(double *x, double *y, double *w, int n, int k, double lambda
   return loss+lambda*pen;
 }
 
-double tf_obj_glm(double *x, double *y, double *w, int n, int k, double lambda, 
+double tf_obj_glm(const double *x, const double *y, const double *w, int n, int k, double lambda, 
     func_RtoR b, double *beta, double *buf) {
   int i;
   double loss, pen;
