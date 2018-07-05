@@ -27,10 +27,10 @@ cdef extern from "proxtv.h":
                double* info) nogil
 
 
-cpdef double[::1] ldr2_tv(const size_t d1,
-                          const size_t d2,
-                          const double[::1] y,
-                          const double lambda_tv):
+cpdef double[::1] ldr2_tv(size_t d1,
+                          size_t d2,
+                          double[::1] y,
+                          double lambda_tv):
     """ Handle to weighted pdas solver allowing warm start intialization"""
    
     # Initialize variables
