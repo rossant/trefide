@@ -397,6 +397,25 @@ cdef double[::1] format_temporal(const size_t[::1] block_ranks,
     # Return single array containing all temporal components
     return temporal_outputs
 
+
+cpdef size_t compression_factor(const size_t[::1] block_ranks,
+                                const size_t[::1] block_dims,
+                                const size_t fov_height,
+                                const size_t fov_width,
+                                const size_t num_frames,
+                                const size_t num_blocks):
+    """ Compute the compressin factor achieved by storing movie as factored 
+       components as compared to naive representation as full matrix. """
+
+    # Compute Size Of Compressed Factors
+    cdef size_t bdx, compressed_size = 0
+    for bdx in range(num_blocks):
+        compressed_size += block_ranks[bdx] * (block_dims[bdx*2] * block_dims[bdx*2+1] + num_frames)
+
+    # Take Ratio With Size Of Original Mov Matrix
+    return (fov_height * fov_width * num_frames) / compressed_size
+
+
 # ------------------------ Full FOV PMD(TF,TV) Wrappers ------------------------#
 
 
@@ -502,7 +521,13 @@ cpdef blockwise_decompose(const double[:, :, ::1] input_mov,
                           'fov_indices': block_indices,
                           'format_indices': block_access,
                           'dims': block_dims,
-                          'ranks': block_ranks}}
+                          'ranks': block_ranks,
+                          'compression_factor': compression_factor(block_ranks,
+                                                                   block_dims,
+                                                                   fov_height,
+                                                                   fov_width,
+                                                                   num_frames,
+                                                                   num_blocks)}}
 
     return spatial_outputs, temporal_outputs, metadata
 
@@ -510,6 +535,129 @@ cpdef blockwise_decompose(const double[:, :, ::1] input_mov,
 # -----------------------------------------------------------------------------#
 # ---------------------- Compression Format Utilities -------------------------#
 # -----------------------------------------------------------------------------#
+
+# --- Overlapping Recombination Weights ---
+
+
+cpdef double[::1,:] get_quadrant_weights(size_t block_height, 
+                                         size_t block_width): 
+    """ Populate The Upper Left Corner Of The Recombination Weight Matrix """
+
+    # Declare Local Variables
+    cdef size_t i, j
+
+    # Populate Upper Left Corner Of Weighting Matrix
+    cdef double[::1,:] ul_corner = np.empty((block_height / 2, block_width / 2),
+                                            dtype=np.float64, order='F')
+    for j in range(block_width / 2):
+        for i in range(block_height / 2):
+            ul_corner[i,j] = min(i, j)
+
+    # Compute & Normalize By Cumulative Overlapped Weights
+    cdef double[::1,:] cum_weights = np.asfortranarray(np.asarray(ul_corner) +\
+            np.fliplr(ul_corner) + np.flipud(ul_corner) +\
+            np.fliplr(np.flipud(ul_corner))) 
+    for j in range(block_width / 2):
+        for i in range(block_height / 2):
+            ul_corner[i,j] = ul_corner[i,j] / cum_weights[i,j]
+
+    return ul_corner
+
+
+cdef double* get_weight_pointer(double* full, double* top_half, double* bottom_half,
+                                size_t block_height, size_t block_width,
+                                bool vert_small, bool horiz_small, 
+                                bool left_edge, bool top_edge) nogil:
+    """ Find Starting Memory Location From Which To Apply Weights"""
+
+    if vert_small and horiz_small:  # Corners
+
+        if left_edge and top_edge:  # Upper Left
+            return &bottom_half[block_height * block_width]
+
+        elif left_edge:  # Lower Left 
+            return &top_half[block_height * block_width] 
+
+        elif top_edge:  # Upper Right
+            return &bottom_half[0]
+
+        else:  # Lower Right
+            return &top_half[0]
+    
+    elif vert_small:  # Top & Bottom Rows
+        
+        if top_edge:  # Top
+            return &bottom_half[0]
+
+        else:  #  Bottom
+            return &top_half[0]
+    
+    elif horiz_small:  # Left & Right Edges
+        
+        if left_edge:  # Left
+            return &full[block_height * block_width]
+        
+        else:  # Right
+            return &full[0]
+    
+    else:  # Standard Blocks
+        return &full[0]
+
+
+cdef void apply_weights(const double* weights, 
+                        const size_t block_size,
+                        double* spatial_component) nogil:
+    """ Modify A Spatial Component Inplace By Applying Recombination Wewights """
+    cdef size_t idx
+    for idx in range(block_size):
+        spatial_component[idx] *= weights[idx]
+
+
+cpdef void apply_recombination_weights(dict metadata, 
+                                       double[::1] spatial_components):
+    """ Updates Spatial Components Inplace By Applying Overlapping Recombination Weights"""
+    
+    # Extract Relevant Metadata
+    cdef size_t[::1] block_indices = metadata['format']['fov_indices']
+    cdef size_t[::1] block_dims = metadata['format']['dims']
+    cdef size_t[::1] block_ranks = metadata['format']['ranks']
+    cdef size_t[::1] block_access = metadata['format']['format_indices']
+    cdef size_t num_blocks = metadata['format']['num_blocks']
+    cdef size_t block_height = metadata['params']['block_height']
+    cdef size_t block_width = metadata['params']['block_width'] 
+
+    # Compute Recombination Matrix For Standard Block
+    cdef double[::1,:] ul_corner = get_quadrant_weights(block_height, block_width)
+    cdef double[::1,:] top_half = np.asfortranarray(np.hstack([ul_corner, np.fliplr(ul_corner)]))
+    cdef double[::1,:] bottom_half = np.asfortranarray(np.flipud(top_half))
+    cdef double[::1,:] full = np.asfortranarray(np.vstack([top_half, bottom_half]))
+
+    # Cycle Through Blocks
+    cdef size_t bdx, block_size, curr_index, k
+    cdef bool vert_small, horiz_small
+    cdef double* weight_pointer
+    for bdx in range(num_blocks):
+        
+        # Check For Literal Edge & Corner Cases
+        vert_small = block_dims[bdx * 2] < block_height
+        horiz_small = block_dims[bdx * 2 + 1] < block_width
+        left_edge = block_indices[bdx * 2] == 0
+        top_edge = block_indices[bdx * 2 + 1] == 0
+        
+        # Get Memory Address Of Weights For This Block
+        weight_pointer = get_weight_pointer(&full[0,0], &top_half[0,0], &bottom_half[0,0],
+                                            block_dims[bdx * 2], block_dims[bdx * 2 + 1], 
+                                            vert_small, horiz_small, 
+                                            left_edge, top_edge)
+
+        # Apply Weights To Each Spatial Component In Block
+        block_size = block_dims[bdx * 2] * block_dims[bdx * 2 + 1]
+        for k in range(block_ranks[bdx]):
+            curr_index = block_access[bdx * 2] + k * block_size
+            apply_weights(weight_pointer, block_size, &spatial_components[curr_index])
+ 
+
+# --- Reformatting ---
 
 
 cpdef format_as_matrices(double[::1] spatial_components, 
@@ -531,7 +679,7 @@ cpdef format_as_matrices(double[::1] spatial_components,
     cdef size_t[::1] block_access = metadata['format']['format_indices']
     cdef size_t[::1] block_dims = metadata['format']['dims']
     cdef size_t[::1] block_ranks = metadata['format']['ranks']
-    
+ 
     # Allocate Space For Sparse Matrix Representation
     cdef size_t[::1] indices = np.zeros(block_access[num_blocks * 2], dtype=np.uint64)
     cdef size_t[::1] indptr = np.zeros(total_rank + 1, dtype=np.uint64)
@@ -551,7 +699,7 @@ cpdef format_as_matrices(double[::1] spatial_components,
     # Construct Scipy CSC Format Object
     U = sparse.csc_matrix((np.array(spatial_components), np.array(indices), np.array(indptr)),
                           shape=(fov_height * fov_width, total_rank)) 
-    
+ 
     # Construct Numpy Object From (Column Major) Array 
     V = np.reshape(temporal_components, (total_rank, num_frames))
 
