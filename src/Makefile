@@ -35,7 +35,7 @@ OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 # Compiler Dependent Environment Variables 
 ifeq ($(CC), gcc)
     CXX = g++
-    CXXFLAGS = -fopenmp -O3 -fPIC -I$(PROXTV) -I$(GLMGEN)/include -L$(PROXTV) -L$(GLMGEN)/lib -D NOMATLAB=1
+    CXXFLAGS = -fopenmp -O3 -fPIC -I$(PROXTV) -I$(CONDA_PREFIX)/include -I$(GLMGEN)/include -L$(PROXTV) -L$(GLMGEN)/lib -L$(CONDA_PREFIX)/lib -D NOMATLAB=1
 
 else
     CXX = icpc

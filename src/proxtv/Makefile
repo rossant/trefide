@@ -33,7 +33,7 @@ OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 # Compiler Dependent Environment Variables 
 ifeq ($(CC), gcc)
     CXX = g++
-    CXXFLAGS = -O3 -fPIC -D NOMATLAB=1
+    CXXFLAGS = -O3 -fPIC -D NOMATLAB=1 -I$(CONDA_PREFIX)/include -L$(CONDA_PREFIX)/lib
 else
     CXX = icpc
     CXXFLAGS = -mkl=sequential -O3 -fPIC -D NOMATLAB=1

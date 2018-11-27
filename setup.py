@@ -23,13 +23,16 @@ LIBRARIES = ["mkl_core",          # Used for FFT, Vector Math, CBLAS, Lapacke, e
              "m"]               # <math.h>
 
 # Compiler Agnostic Args
+CONDA_PREFIX = os.getenv('CONDA_PREFIX', None)
 COMPILE_ARGS = ["-O3",              # Max compiler optimizations
+                "-I" + os.path.join(CONDA_PREFIX, "include"),
                 "-I" + os.path.join(TREFIDE, "src"),              # Location of trefide.h
                 "-I" + os.path.join(TREFIDE, "src", "proxtv"),    # Location Of proxtv.h
                 "-I" + os.path.join(TREFIDE, "src", "glmgen", "include"), # Location of glmgen.h
                 "-D NOMATLAB=1"]                                  # Ignore ProXTV's attempt to mex
 
-LINK_ARGS = ["-L" + os.path.join(TREFIDE, "src"),            # Location of libtrefide.so (Add to $LD_LIBRARY_PATH)
+LINK_ARGS = ["-L" + os.path.join(CONDA_PREFIX, "lib"),
+             "-L" + os.path.join(TREFIDE, "src"),            # Location of libtrefide.so (Add to $LD_LIBRARY_PATH)
              "-L" + os.path.join(TREFIDE, "src", "proxtv"),  # Location of libproxtv.so  (Add to $LD_LIBRARY_PATH)
              "-L"+os.path.join(TREFIDE, "src", "glmgen", "lib")]  # Location of libglmgen.so (Add to $LD_LIBRARY_PATH)
 
