@@ -1,20 +1,25 @@
 CXX = icpc
-CXXFLAGS = -mkl=sequential -O3 -fPIC -I$(shell pwd)/proxtv -D NOMATLAB=1 #-mkl=parallel -qopenmp
+CXXFLAGS = -mkl=sequential -qopenmp -O3 -fPIC -I$(shell pwd)/proxtv -I$(shell pwd)/glmgen/include/ -D NOMATLAB=1 #-mkl=parallel
 LDFLAGS = -shared
-DEP_DIR = proxtv
-DEP_LIB = $(DEP_DIR)/libproxtv.so
-TARGET_LIB = libtrefide.so
-LIBS = -lmkl_intel_lp64 -lmkl_core -lm  #-lmkl_intel_thread -liomp5
-SRCS = welch.cpp wpdas.cpp line_search.cpp utils.cpp ipm.cpp pmd.cpp
+PROXTV = proxtv
+LIBPROXTV = $(PROXTV)/libproxtv.so
+GLMGEN = glmgen
+LIBGLMGEN = $(GLMGEN)/lib/libglmgen.so
+LIBTREFIDE = libtrefide.so
+LIBS = -lmkl_intel_lp64 -lmkl_core -lm -lmkl_intel_thread -liomp5
+SRCS = utils/welch.cpp proxtf/wpdas.cpp proxtf/line_search.cpp proxtf/utils.cpp proxtf/l1tf/ipm.cpp proxtf/admm.cpp pmd/pmd.cpp pmd/decimation.cpp
 OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 
 .PHONY: all
-all: $(DEP_LIB) $(TARGET_LIB)
+all: $(LIBPROXTV) $(LIBGLMGEN) $(LIBTREFIDE)
 
-$(DEP_LIB):
-	cd $(DEP_DIR); make clean; make;
+$(LIBPROXTV):
+	cd $(PROXTV); make;
 
-$(TARGET_LIB): $(OBJS)
+$(LIBGLMGEN):
+	cd $(GLMGEN); make;
+
+$(LIBTREFIDE): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(SRCS:.cpp=.d) : %.d : %.cpp
@@ -22,4 +27,6 @@ $(SRCS:.cpp=.d) : %.d : %.cpp
 
 .PHONY : clean 
 clean:
-	rm -f $(TARGET_LIB) $(OBJS) $(SRCS:.cpp=.d)
+	rm -f $(LIBTREFIDE) $(OBJS) $(SRCS:.cpp=.d)
+	cd $(PROXTV); make clean;
+	cd $(GLMGEN); make clean;

@@ -6,9 +6,8 @@
 
 cimport numpy as np
 import numpy as np
-from trefide.solvers.time.lagrangian import lpdas
-from trefide.solvers.time.constrained import cpdas 
-from trefide.utils.noise import estimate_noise
+from trefide.solvers.temporal import cps_cpdas, lpdas
+from trefide.utils import psd_noise_estimate
 
 
 np.import_array()
@@ -33,16 +32,15 @@ cdef class TrendFilter:
         if delta > 0:
             self.delta = delta
         else:
-            self.delta = estimate_noise([y], estimator='pwelch', summarize='logmexp')[0] ** 2
+            self.delta = psd_noise_estimate(y[None, :])[0]
 
         # Call constrained solver
-        x_hat, self.warm_start, self.lambda_, _ = cpdas(y, 
-                                                        self.delta,
-                                                        wi=self.weights,
-                                                        z_hat=self.warm_start, 
-                                                        lambda_=self.lambda_,
-                                                        max_interp=0,
-                                                        verbose=self.verbose)
+        x_hat, self.warm_start, self.lambda_, _ = cps_cpdas(y, 
+                                                            self.delta,
+                                                            wi=self.weights,
+                                                            z_hat=self.warm_start, 
+                                                            lambda_=self.lambda_,
+                                                            verbose=self.verbose)
         self.notfit = 0
         return x_hat
 

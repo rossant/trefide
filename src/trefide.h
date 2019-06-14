@@ -1,10 +1,12 @@
 #ifndef TREFIDE_H
 #define TREFIDE_H
 
-#include "utils.h"
-#include "ipm.h"
-#include "wpdas.h"
-#include "line_search.h"
-#include "welch.h"
-#include "pmd.h"
+#include "proxtf/utils.h"
+#include "proxtf/l1tf/ipm.h"
+#include "proxtf/wpdas.h"
+#include "proxtf/line_search.h"
+#include "proxtf/admm.h"
+#include "utils/welch.h"
+#include "pmd/pmd.h"
+#include "pmd/decimation.h"
 #endif /* TREFIDE_H */
